@@ -1,0 +1,9 @@
+{
+  "_readme": "uid(登录邮箱) -> 该账号能看到的家庭中心 uuid 列表。改完执行 systemctl restart xiaoyan-cloud 生效。",
+  "_note": "下面是示例，真实文件里按自己的情况改。没登记的 uid 会看到空列表。本服务只允许邮箱登录。",
+  "_member_type": 2,
+  "_mqtt_acl": true,
+  "_vg_bridge": false,
+  "user@example.com": ["box-xx-xx-xx-xx-xx-xx"],
+  "guest@example.com": ["box-yy-yy-yy-yy-yy-yy"]
+}

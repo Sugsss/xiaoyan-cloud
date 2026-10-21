@@ -1,0 +1,11 @@
+[
+ {
+  "ip": "192.168.x.x",
+  "token": "<网关 /ws/json 的 lanAccessToken，见 GATEWAY_INTEL.md>",
+  "username": "<ha_user_test01>",
+  "name": "HA User",
+  "client_id": "<homeass_xxxx>",
+  "hc_uuid": "box-xx-xx-xx-xx-xx-xx",
+  "hc_name": "<显示名>"
+ }
+]

@@ -1,0 +1,16 @@
+*.pyc
+__pycache__/
+*.log
+logs/
+*.apk
+*.zip
+*.pem
+*.keystore
+accounts.json
+tokens.json
+ipuid.json
+admin.json
+tenants.json
+admin_initial.txt
+*.bak.*
+.DS_Store

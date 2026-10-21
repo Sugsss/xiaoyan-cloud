@@ -1,0 +1,19 @@
+[Unit]
+Description=Xiaoyan Home Cloud v4 (xiaoyan remote control)
+After=network.target
+
+[Service]
+LimitNOFILE=65535
+Type=simple
+WorkingDirectory=/opt/xiaoyan-cloud
+Environment=PLAIN=1
+Environment=PORT=9443
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/xiaoyan-cloud/cloud4.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/xiaoyan-cloud/logs/run.out
+StandardError=append:/opt/xiaoyan-cloud/logs/run.err
+
+[Install]
+WantedBy=multi-user.target

@@ -297,6 +297,14 @@ def do_action(be, act, f):
     elif act == "acct_unbind":
         be.unbind(auth.normalize(f.get("uid")), f.get("hc") or "")
         msg = "已解绑"
+    elif act == "dev_unbind":
+        # 2026-10-24 新增：指纹 TTL 改成永久后，这是唯一的主动吊销入口。
+        # 不传 uid = 解绑这个指纹下的所有账号，并强制断开它当前的连接。
+        n, k = be.dev_unbind(f.get("fp") or "", f.get("uid") or "")
+        if not n:
+            err = "没找到这条绑定（可能已经解绑过了）"
+        else:
+            msg = "已解绑 %d 条、强制断开 %d 个连接" % (n, k)
     elif act == "gw_reserve":
         be.set_reserved(f.get("hc") or "", True)
         msg = "已加入保留列表"
@@ -434,6 +442,7 @@ def _page(title, body, active="", sid=None, extra_head=""):
     nav_items = [("overview", "/admin", "概览"),
                  ("accounts", "/admin?tab=accounts", "账号"),
                  ("gateways", "/admin?tab=gateways", "网关"),
+                 ("devices", "/admin?tab=devices", "设备"),
                  ("settings", "/admin?tab=settings", "设置"),
                  ("logs", "/admin?tab=logs", "日志")]
     nav = "".join(
@@ -617,6 +626,60 @@ def page_accounts(snap, sid, q):
     body += ('<script>function pw2(f){var p=f.querySelector("input[name=pw]");'
              'if(p.value.length<8){alert("密码至少 8 位");p.focus();return false}return true}</script>')
     return 200, {}, _page("账号", body, "accounts", sid)
+
+
+# ============================================================ 设备（MQTT 设备指纹）
+def page_devices(snap, sid, q):
+    devs = list(snap.get("dev_uids") or [])
+    # 在线的排前面，其余按「最后一次在家认证」倒序
+    devs.sort(key=lambda d: (not d.get("online"), -(float(d.get("ts") or 0))))
+
+    rows = ""
+    for d in devs:
+        fp = d.get("fp") or ""
+        uid = d.get("uid") or ""
+        ip = d.get("ip") or ""
+        online = bool(d.get("online"))
+        st = ('<span class="tag ok">在线</span> <span class="mono help">%s</span>' % esc(ip)
+              if online else '<span class="tag off">离线</span>')
+        # ★ uid/fp 要进 JS 字符串（confirm）→ 必须用 json.dumps，HTML 转义在
+        #   JS 字符串上下文里不防注入。
+        warn = json.dumps(
+            "确定解绑这台设备？\n\n账号：%s\n指纹：%s\n\n解绑后它会立刻掉线，"
+            "并且除非重新在家里 WiFi 下打开一次 App，否则再也连不上。\n"
+            "★ 如果这是你正在用的手机，解绑会让你自己立刻掉线。" % (uid, fp))
+        rows += ('<tr><td class="mono">%s</td><td class="mono">%s</td>'
+                 '<td class="help">%s</td><td>%s</td><td nowrap>'
+                 '<form class="inline" method=post action="/admin/do" onsubmit="return confirm(%s)">'
+                 '<input type=hidden name=csrf value="%s">'
+                 '<input type=hidden name=action value=dev_unbind>'
+                 '<input type=hidden name=fp value="%s">'
+                 '<input type=hidden name=uid value="%s">'
+                 '<button class="mini danger" type=submit>解绑</button></form>'
+                 '</td></tr>') % (esc(fp), esc(uid), esc(fmt_ts(d.get("ts"))), st,
+                                  warn, _csrf(sid), esc(fp), esc(uid))
+    if not rows:
+        rows = ('<tr><td colspan=5 style="color:var(--muted)">'
+                '还没有设备完成绑定。App 在家里 WiFi 下打开一次，就会自动出现在这里。</td></tr>')
+
+    body = ('<h1>设备</h1>'
+            '<p class="sub">手机 App 每次连接会带一个<b>安装级设备指纹</b>（MQTT username 前 18 位）。'
+            '它是在外网（4G / 别处 WiFi）也能用的凭据 —— 因为 App 的长连接本身不带账号密码。</p>')
+    body += _flash(q)
+    body += ('<div class="card"><h2 style="margin-top:0">已绑定的设备</h2>'
+             '<table><thead><tr><th>设备指纹</th><th>绑定账号</th>'
+             '<th>最后一次在家认证</th><th>状态</th><th>操作</th></tr></thead>'
+             '<tbody>%s</tbody></table></div>') % rows
+    body += ('<div class="card"><h2 style="margin-top:0">安全须知</h2>'
+             '<p class="help" style="margin-top:0">指纹绑定<b>永久有效</b>，'
+             '所以手机丢了、卖掉、淘汰之后必须手工解绑，否则那台设备仍然能看你家状态、'
+             '控制你家的设备。</p>'
+             '<p class="help">另一个自动吊销手段是<b>改账号密码</b>：'
+             '改密会清掉该账号下所有指纹绑定并吊销 token，'
+             '你自己的手机重连时会自动重新绑定，全程无感。</p>'
+             '<p class="help">换新手机 / 重装 App / 清数据会让指纹变化，'
+             '那台新设备必须先在家里 WiFi 下打开一次 App 完成绑定，之后才能在外网漫游。</p></div>')
+    return 200, {}, _page("设备", body, "devices", sid)
 
 
 # ============================================================ 网关
@@ -910,6 +973,8 @@ def _handle(be, method, path, query, headers, body, ip):
         return page_accounts(snap, sid, q)
     if tab == "gateways":
         return page_gateways(snap, sid, q)
+    if tab == "devices":
+        return page_devices(snap, sid, q)
     if tab == "settings":
         return page_settings(snap, sid, q)
     if tab == "logs":

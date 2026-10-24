@@ -139,6 +139,25 @@ IP_UID = {}       # 来源 IP -> {uid: ts}：同一公网 IP 可能有多台手�
 #   共用，窗口越短借用面越小；App 冷启动先 HTTP 后 MQTT（秒级），10 分钟足够覆盖。
 IP_UID_TTL = 600
 
+# ★ 2026-10-24：设备指纹 -> uid（解决「App 用 4G 连不上」）。
+#   背景：ACL 只能靠公网 IP 认人，而手机 4G 出口 IP 与家里宽带出口不同
+#   （实测 家里 <宽带出口IP> / 4G <移动出口IP>），IP 判据必然落空；
+#   而 App 已有登录态不会再走 HTTP 登录，IP_UID 永远补不上 → 结构性死结。
+#   依据：App 的 MQTT username 形如 `xy_sbk_<11位随机串><计数>`，**前 18 位是安装级
+#   随机串**，跨天跨网络恒定（10-18~10-24、3 个出口 IP 实测一致），尾部 4 位是
+#   每次连接的计数。取前 18 位当设备指纹，可在外网漫游时认人。
+#   安全边界：指纹只在「IP 判据已认出 uid」时才建立绑定（强证据），
+#   之后仅凭指纹放行；指纹是 11 位 base36 随机（≈3.7e17），不可枚举。
+DEV_UID = {}          # 设备指纹 -> {uid: ts}
+DEV_UID_FILE = os.environ.get("DEVUID", os.path.join(BASE, "devuid.json"))
+# ★ 0 = 永久有效（2026-10-24 改）。原为 30 天：手机长期不回家（出差）就会过期，
+#   在第 31 天于外网失效 —— 而绑的是**设备**，不会因为没回家就变成别人的设备。
+#   作废改由后台/手工解绑（删 devuid.json 条目）。ts 仍每次在家时刷新，
+#   保留「最后一次在家认证时间」供审计。
+DEV_UID_TTL = 0
+DEV_FP_LEN = 18              # `xy_sbk_` + 11 位随机串
+_DEVUID_LAST_SAVE = [0]
+
 
 def load_tokens():
     """token -> uid 落盘。为什么必须落盘：
@@ -492,6 +511,96 @@ def remember_uid(ip, uid):
         save_ipuid()
 
 
+def dev_fingerprint(username):
+    """App 的 MQTT username -> 设备指纹。取前 DEV_FP_LEN 位，去掉每次连接递增的尾部计数。
+
+    非 App（网关 `box-xxx`、空、异常短）一律返回 ""，绝不参与判据 ——
+    指纹是弱凭据，只对 App 这类「无凭据客户端」开，网关有自己的 hc 校验。"""
+    u = username or ""
+    if not u.startswith("xy_sbk_"):
+        return ""
+    if len(u) < DEV_FP_LEN:
+        return ""
+    return u[:DEV_FP_LEN]
+
+
+def dev_uid_alive(ts, now=None):
+    """指纹绑定是否仍然有效。集中在一处判断，避免 4 个调用点各写一遍 TTL 逻辑。
+
+    DEV_UID_TTL == 0 表示永久有效（2026-10-24 起），此时只要求 ts 是个合法时间值。"""
+    if not DEV_UID_TTL:
+        try:
+            return float(ts) > 0
+        except Exception:
+            return False
+    return (now if now is not None else time.time()) - float(ts) < DEV_UID_TTL
+
+
+def load_devuid():
+    """指纹 -> uid 落盘。不落盘的话服务一重启，正在外面用 4G 的手机立刻变匿名。"""
+    if not os.path.exists(DEV_UID_FILE):
+        return {}
+    try:
+        raw = json.load(open(DEV_UID_FILE, encoding="utf-8"))
+        now = time.time()
+        out = {}
+        for k, v in (raw or {}).items():
+            if isinstance(v, dict):
+                rec = dict((str(u), float(ts)) for u, ts in v.items()
+                           if dev_uid_alive(ts, now))
+            elif isinstance(v, (list, tuple)) and len(v) == 2:
+                rec = {str(v[0]): float(v[1])}
+            else:
+                continue
+            if rec:
+                out[str(k)] = rec
+        return out
+    except Exception as e:
+        log("[acl] 读 %s 失败: %s" % (DEV_UID_FILE, e))
+        return {}
+
+
+def save_devuid(force=False):
+    now = time.time()
+    if not force and now - _DEVUID_LAST_SAVE[0] < 60:
+        return
+    _DEVUID_LAST_SAVE[0] = now
+    try:
+        with TENANT_LOCK:
+            snap = {}
+            for fp, rec in DEV_UID.items():
+                keep = dict((u, ts) for u, ts in (rec or {}).items()
+                            if dev_uid_alive(ts, now))
+                if keep:
+                    snap[fp] = keep
+        tmp = DEV_UID_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=1)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, DEV_UID_FILE)
+    except Exception as e:
+        log("[acl] 写 %s 失败: %s" % (DEV_UID_FILE, e))
+
+
+def remember_dev(username, uids):
+    """把「这个设备指纹」绑定到「这些账号」。★ 只在 IP 判据已经认出人时才调用，
+    绝不允许用指纹自己给自己续绑定（否则一次误绑会永久生效）。"""
+    fp = dev_fingerprint(username)
+    if not fp or not uids:
+        return
+    now = time.time()
+    with TENANT_LOCK:
+        rec = DEV_UID.setdefault(fp, {})
+        for u in uids:
+            rec[u] = now
+        for u in [u for u, ts in rec.items() if not dev_uid_alive(ts, now)]:
+            rec.pop(u, None)
+        if len(rec) > 8:                      # 一台手机最多绑 8 个账号
+            for u, _ in sorted(rec.items(), key=lambda kv: kv[1])[:-8]:
+                rec.pop(u, None)
+    save_devuid()
+
+
 # ★ IP -> uid 的落盘回填（原先在第 191 行，那时 load_ipuid 还没定义 → 一直静默失败）。
 #   放在这里的原因：此刻 load_ipuid 已定义、IP_UID / IP_UID_TTL 常量也已就绪。
 #   作用：服务重启后 MQTT ACL 仍能认出「这台公网 IP 刚才登录过谁」，
@@ -502,6 +611,15 @@ try:
         log("[acl] 已从 %s 回填 %d 条 IP 登录记录" % (IPUID_FILE, len(IP_UID)))
 except Exception as _ipuid_err:
     log("[acl] 回填 %s 失败: %s: %s" % (IPUID_FILE, type(_ipuid_err).__name__, _ipuid_err))
+
+# ★ 设备指纹绑定的落盘回填（2026-10-24）：服务一重启，正在外面用 4G 的手机
+#   仍能凭指纹认人，不会被打回匿名（IP 判据在外网本来就落空）。
+try:
+    DEV_UID.update(load_devuid())
+    if DEV_UID:
+        log("[acl] 已从 %s 回填 %d 条设备指纹绑定" % (DEV_UID_FILE, len(DEV_UID)))
+except Exception as _devuid_err:
+    log("[acl] 回填 %s 失败: %s: %s" % (DEV_UID_FILE, type(_devuid_err).__name__, _devuid_err))
 
 
 # ============================================================ Web 后台数据桥
@@ -549,6 +667,34 @@ class AdminBackend:
             sessions = len(BROKER.sessions)
         except Exception:
             pass
+        # ---- 设备指纹绑定（2026-10-24 新增）
+        #   指纹 TTL 改成永久之后，「后台能看到并解绑」就是唯一的安全出口，
+        #   否则一部丢了/卖掉的手机会永久保有访问权。这里顺便标出当前是否在线、
+        #   从哪个公网 IP 连着，方便判断「这是我现在用的手机」还是「该踢的」。
+        dev_uids = []
+        try:
+            with BROKER.lock:
+                _sess = list(BROKER.sessions)
+        except Exception:
+            _sess = []
+        live = {}
+        for _s in _sess:
+            _fp = dev_fingerprint(getattr(_s, "mqtt_user", "") or "")
+            if _fp:
+                live.setdefault(_fp, []).append(
+                    (getattr(_s, "pub_ip", "") or "", getattr(_s, "tag", "")))
+        with TENANT_LOCK:
+            _dev = dict((k, dict(v or {})) for k, v in DEV_UID.items())
+        for _fp in sorted(_dev):
+            for _u in sorted(_dev[_fp]):
+                _live = live.get(_fp) or []
+                dev_uids.append({
+                    "fp": _fp,
+                    "uid": _u,
+                    "ts": _dev[_fp][_u],
+                    "online": bool(_live),
+                    "ip": _live[0][0] if _live else "",
+                })
         return {
             "accounts": accounts,
             "tenants": tenants,
@@ -556,6 +702,7 @@ class AdminBackend:
             "reserved": sorted(RESERVED),
             "auto_claim": AUTO_CLAIM,
             "claim_window": CLAIM_WINDOW,
+            "dev_uids": dev_uids,
             "stats": {"uptime": time.time() - self.started,
                       "sessions": sessions,
                       "tokens": len(TOKENS)},
@@ -606,6 +753,48 @@ class AdminBackend:
             TENANTS[uid] = cur
         save_tenants()
         log("[admin] 手工解绑 %s -/-> %s" % (uid, hc))
+
+    # ---- 写（设备指纹）
+    def dev_unbind(self, fp, uid=None):
+        """解绑一个设备指纹；uid 为空 = 这个指纹下的所有账号。
+
+        ★ 必须同时踢掉该指纹当前的在线会话：只删绑定而长连接还活着的话，
+        App 已经订阅的 event/<hc> 照样收事件、照样能下发控制，解绑就是假的。
+        返回 (解除条数, 踢掉的会话数)。"""
+        fp = (fp or "").strip()
+        if not fp:
+            return 0, 0
+        with TENANT_LOCK:
+            rec = DEV_UID.get(fp)
+            if not rec:
+                return 0, 0
+            if uid:
+                n = 1 if uid in rec else 0
+                rec.pop(uid, None)
+            else:
+                n = len(rec)
+                rec = {}
+            if rec:
+                DEV_UID[fp] = rec
+            else:
+                DEV_UID.pop(fp, None)
+        save_devuid(force=True)
+        kicked = 0
+        try:
+            with BROKER.lock:
+                victims = [s for s in BROKER.sessions
+                           if dev_fingerprint(getattr(s, "mqtt_user", "") or "") == fp]
+        except Exception:
+            victims = []
+        for s in victims:
+            try:
+                s.kick("后台解绑指纹 %s" % fp[:12])
+                kicked += 1
+            except Exception as e:
+                log("[admin] 踢会话失败: %s: %s" % (type(e).__name__, e))
+        log("[admin] 解绑设备指纹 %s uid=%s：解除 %d 条、强制断开 %d 个连接"
+            % (fp[:12], uid or "(全部)", n, kicked))
+        return n, kicked
 
     # ---- 写（控制键）
     def set_reserved(self, hc, on):
@@ -818,8 +1007,8 @@ def hc_of_vg(vg):
     return ""
 
 
-def mqtt_acl_uids(sess):
-    """MQTT 会话 -> 它**可能**代表哪些账号。只认强证据，绝不用客户端自报的 topic。
+def mqtt_acl_uids_by_ip(sess):
+    """只靠**公网 IP** 认人：IP_UID 登录记录 + 同 IP 在线网关。
 
     返回列表而不是单值：一个公网 IP 后面可能是一个家里的多台手机 / 多个账号，
     取单一「最后登录者」会让另一台手机立刻被判越权（实测踩过）。"""
@@ -840,6 +1029,33 @@ def mqtt_acl_uids(sess):
                 for uid, hcs in TENANTS.items():
                     if hc in hcs and uid not in out:
                         out.append(uid)
+    return out
+
+
+def mqtt_acl_uids(sess):
+    """MQTT 会话 -> 它**可能**代表哪些账号。只认强证据，绝不用客户端自报的 topic。
+
+    两条判据，先 IP 后指纹（2026-10-24）：
+      ① 公网 IP —— 家里 WiFi 场景：HTTP 登录记录 / 同 IP 有在线网关
+      ② 设备指纹 —— 4G 漫游场景：手机出口 IP 与家里不同，① 必然落空
+         （实测 家里 <宽带出口IP> vs 4G <移动出口IP>），靠 App 安装级
+         随机串 `xy_sbk_*` 认人。绑定只在 ① 成立时才写入，见 remember_dev。
+    """
+    out = mqtt_acl_uids_by_ip(sess)
+    if out:
+        return out
+    fp = dev_fingerprint(getattr(sess, "mqtt_user", "") or "")
+    if not fp:
+        return out
+    now = time.time()
+    with TENANT_LOCK:
+        rec = dict(DEV_UID.get(fp) or {})
+    for u, ts in rec.items():
+        if dev_uid_alive(ts, now) and u not in out:
+            out.append(u)
+    if out:
+        log("[acl] 指纹认人 fp=%s... uids=%s ip=%s"
+            % (fp[:12], ",".join(out), getattr(sess, "pub_ip", "") or "?"))
     return out
 
 
@@ -1562,8 +1778,16 @@ class Session:
             username = None
             if cflags & 0x80:
                 username, j = mqtt_read_string(body, j)
+            # ★ 取证：App 到底有没有带 password 字段（0x40）。没有的话，MQTT 这条通道
+            #   就**根本没有密码可校验**，只能靠 IP/指纹认人 —— 这是安全模型的根。
+            password = None
+            if cflags & 0x40:
+                password, j = mqtt_read_string(body, j)
             self.client_id = cid
-            log(f"[{self.tag}] CONNECT v{level} clientId={cid!r} user={username!r} ka={ka}")
+            # 设备指纹判据要用（App 是 `xy_sbk_<安装随机串><计数>`，网关是 `box-xxx`）
+            self.mqtt_user = username or ""
+            log(f"[{self.tag}] CONNECT v{level} clientId={cid!r} user={username!r} ka={ka} "
+                f"cflags=0x{cflags:02x} pw={password!r}")
             # ★★ 身份闸门（P0）：没有任何身份依据的连接在这里就断掉 ★★
             # 为什么必须放在 CONNECT：MQTT 的权限口子全在「连接之后」，而客户端
             # 自报的 clientId / username 我们无法验证。历史上有两个直接绕过：
@@ -1594,15 +1818,20 @@ class Session:
                     self.alive = False
                     return
             else:
-                # —— App：来源 IP 必须能还原出至少一个账号 ——
+                # —— App：来源 IP 或设备指纹必须能还原出至少一个账号 ——
+                _ip_uids = mqtt_acl_uids_by_ip(self)
                 _uids = mqtt_acl_uids(self)
                 if not _uids:
                     log("[acl] 拒绝 CONNECT 无身份 App clientId=%r ip=%s"
-                        "（IP 没有登录记录，也没有同 IP 的网关）"
+                        "（IP 没有登录记录/同 IP 网关，设备指纹也没绑过）"
                         % (cid, _pub_ip or "?"))
                     self.send_raw(b"\x20\x02\x00\x05")
                     self.alive = False
                     return
+                # ★ 建立/续期设备指纹绑定：只在 IP 判据已认出人时写，
+                #   这样手机在外面（IP 完全不同）也能凭指纹认人。
+                if _ip_uids:
+                    remember_dev(username, _ip_uids)
                 self.uid = _uids[0]     # 只用于日志/展示，ACL 判定仍走 mqtt_acl_uids
             self.send_raw(b"\x20\x02\x00\x00")
             # ★ 已删除「自动订阅 message/<cid>、event/<cid>」两行（P0-1）：
@@ -1723,6 +1952,24 @@ class Session:
 
         else:
             log(f"[{self.tag}] {name} flags={flags} {short(body, 40)}")
+
+    def kick(self, reason=""):
+        """★ 真正断开这条 MQTT 会话（后台解绑设备指纹时用）。
+
+        只置 alive=False 是不够的：run() 正阻塞在 socket recv，长连接还会继续
+        收发，App 已订阅的 event/<hc> 照样收事件、照样能下发控制 —— 那样解绑
+        就是假的。必须关掉 socket 让 recv 抛错退出，BROKER.drop 才会真正执行。"""
+        self.alive = False
+        try:
+            self.s.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.s.close()
+        except Exception:
+            pass
+        BROKER.drop(self)
+        log("[admin] 踢掉会话 %s（%s）" % (self.tag, reason or "无原因"))
 
     def run(self):
         try:
@@ -2106,7 +2353,27 @@ def handle_http(sess: Session, lines, rest):
                     _revoked += 1
             if _revoked:
                 save_tokens()
-            log(f"[{sess.tag}] -> 改密码成功 uid={_puid} 吊销其他 token {_revoked} 条")
+            # ★★ 2026-10-24：改密必须同时清掉**设备指纹绑定**，否则等于没改。
+            #   MQTT 那条通道既不认 token 也不认密码，只认指纹；丢了/卖了手机的人改了密码，
+            #   旧手机照样能订阅 `event/<hc>` 和下发 `message/<hc>`（指纹还是永久有效）。
+            #   只吊销 token 是挡不住的 —— 这就是「改了密码对方还能控我家灯」的口子。
+            _dev_cleared = 0
+            with TENANT_LOCK:
+                for _fp in list(DEV_UID.keys()):
+                    _rec = DEV_UID.get(_fp) or {}
+                    if _puid in _rec:
+                        _rec.pop(_puid, None)
+                        _dev_cleared += 1
+                        if not _rec:
+                            DEV_UID.pop(_fp, None)
+            if _dev_cleared:
+                save_devuid(force=True)
+            # 让**当前这台**设备立刻自愈：改密请求本身带有效 token（强凭据），
+            # 把当前 IP 记为可信 → App 重连时命中 IP 判据 → 自动重新绑定指纹，用户无感；
+            # 而丢的那台手机在别的 IP，指纹已清且没有 IP 依据 → 永久挡在外面。
+            remember_uid(_pwip, _puid)
+            log(f"[{sess.tag}] -> 改密码成功 uid={_puid} 吊销其他 token {_revoked} 条、"
+                f"清除设备指纹绑定 {_dev_cleared} 条（其他设备须重新在家认证）")
         return
 
     if is_scanner(bare):

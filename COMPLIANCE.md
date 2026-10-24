@@ -36,7 +36,7 @@
 ### ✅ 有
 
 - 自己写的服务端代码（`xiaoyan-cloud/`）、运维脚本（`tools/`）、打包工具（`repack/`）
-- 协议逆向的**结论性文档**（`PROTOCOL.md`、`MESSAGE_MAP.md` 等）
+- 协议逆向的**结论性文档**（`docs/re/PROTOCOL.md`、`docs/re/MESSAGE_MAP.md` 等）
 - 第三方组件参考：`terncy-0.4.2/`（官方 Python 包）、`ha-plugin/`（Home Assistant 组件）
   —— **各自保留原 LICENSE，仅作参考，未修改分发**
 

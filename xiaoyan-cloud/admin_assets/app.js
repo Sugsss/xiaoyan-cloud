@@ -208,6 +208,7 @@
     ['overview', '概览', '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M1.5 6h13M6 6v8.5"/></svg>'],
     ['accounts', '账号', '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="5" r="2.8"/><path d="M2.5 14c1-2.6 3-4 5.5-4s4.5 1.4 5.5 4"/></svg>'],
     ['gateways', '网关', '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="3" width="13" height="10" rx="1.5"/><path d="M4.5 6.5h2M9.5 6.5h2M4.5 9.5h2M9.5 9.5h2"/></svg>'],
+    ['devices', '设备', '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4.5" y="1.5" width="7" height="13" rx="1.6"/><path d="M7 12.6h2"/></svg>'],
     ['settings', '设置', '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4"/></svg>'],
     ['logs', '日志', '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 2.5h7l3 3v8H3z"/><path d="M5.5 7.5h5M5.5 10h3"/></svg>']
   ];
@@ -273,7 +274,7 @@
     Array.prototype.forEach.call(document.querySelectorAll('.nav a'), function (a) {
       a.classList.toggle('on', a.getAttribute('data-nav') === name);
     });
-    var titleMap = { overview: '概览', accounts: '账号', gateways: '网关', settings: '设置', logs: '日志' };
+    var titleMap = { overview: '概览', accounts: '账号', gateways: '网关', devices: '设备', settings: '设置', logs: '日志' };
     var t = document.getElementById('page-title');
     if (t) t.textContent = '小燕家庭云 · ' + titleMap[name];
     currentView = VIEWS[name](content);
@@ -630,6 +631,89 @@
     return { reload: load, destroy: function () {} };
   }
 
+  // ==================== 视图：设备（MQTT 设备指纹）====================
+  // 2026-10-24 新增。指纹绑定改成永久有效之后，这里是唯一的主动吊销入口：
+  // 手机丢了/卖掉/淘汰必须能在这里解绑，否则那台设备永远保有访问权。
+  function viewDevices(root) {
+    root.innerHTML =
+      '<div class="page-head"><div><h1>设备</h1>' +
+      '<div class="sub">手机 App 的连接凭据（安装级指纹）· 在外网 4G 下就靠它认人</div></div>' +
+      '<div class="acts"><button class="ghost" id="dv-refresh">刷新</button></div></div>' +
+      '<div class="card"><div id="dv-table">' +
+      '<div class="loading"><span class="spinner"></span>加载中…</div></div></div>' +
+      '<div class="card"><h2>安全须知</h2>' +
+      '<p class="help" style="margin-top:0">指纹绑定<b>永久有效</b>。手机丢了、卖掉、淘汰不用了必须手工解绑，' +
+      '否则那台设备仍然能看你家的状态、控制你家的设备。</p>' +
+      '<p class="help">另一个自动吊销手段是<b>改账号密码</b>：改密会清掉该账号下所有指纹绑定并吊销 token，' +
+      '你自己的手机重连时会自动重新绑定，全程无感。</p>' +
+      '<p class="help">换新手机 / 重装 App / 清数据会让指纹变化，新设备必须先在家里 WiFi 下' +
+      '打开一次 App 完成绑定，之后才能在外网漫游。</p></div>';
+
+    var snap = null;
+
+    function renderTable() {
+      var box = document.getElementById('dv-table');
+      if (!snap) return;
+      var devs = (snap.dev_uids || []).slice().sort(function (a, b) {
+        if (!!a.online !== !!b.online) return a.online ? -1 : 1;
+        return (b.ts || 0) - (a.ts || 0);
+      });
+      if (!devs.length) {
+        box.innerHTML = '<div class="empty"><div class="big">还没有设备完成绑定</div>' +
+          'App 在家里 WiFi 下打开一次，就会自动出现在这里</div>';
+        return;
+      }
+      var rows = devs.map(function (d) {
+        var st = d.online
+          ? '<span class="tag ok">在线</span> <span class="mono dim">' + esc(d.ip || '') + '</span>'
+          : '<span class="tag off">离线</span>';
+        return '<tr>' +
+          '<td data-label="设备指纹" class="mono">' + esc(d.fp) + '</td>' +
+          '<td data-label="绑定账号" class="mono">' + esc(d.uid) + '</td>' +
+          '<td data-label="最后在家认证" class="dim">' + fmtTs(d.ts) + '</td>' +
+          '<td data-label="状态">' + st + '</td>' +
+          '<td data-label="操作" class="nowrap">' +
+            '<button class="mini danger" data-act="unbind" data-fp="' + esc(d.fp) +
+              '" data-uid="' + esc(d.uid) + '">解绑</button>' +
+          '</td></tr>';
+      }).join('');
+      box.innerHTML = '<div class="table-wrap"><table class="RespTable"><thead><tr>' +
+        '<th>设备指纹</th><th>绑定账号</th><th>最后在家认证</th><th>状态</th><th>操作</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+    }
+
+    function load() {
+      api('/admin/api/snapshot').then(function (d) {
+        if (!d || !d.ok) return;
+        snap = d;
+        renderTable();
+      });
+    }
+
+    document.getElementById('dv-refresh').addEventListener('click', load);
+    document.getElementById('dv-table').addEventListener('click', function (e) {
+      var btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      if (btn.getAttribute('data-act') !== 'unbind') return;
+      var fp = btn.getAttribute('data-fp');
+      var uid = btn.getAttribute('data-uid');
+      openModal({
+        title: '解绑这台设备',
+        html: '账号 <b>' + esc(uid) + '</b><br>指纹 <b>' + esc(fp) + '</b><br><br>' +
+              '<span class="dim">解绑后它会立刻掉线，并且除非重新在家里 WiFi 下打开一次 App，' +
+              '否则再也连不上。</span>' +
+              '<br><br><b style="color:var(--bad)">★ 如果这是你正在用的手机，' +
+              '解绑会让你自己立刻掉线。</b>',
+        danger: true, okText: '解绑'
+      }).then(function (ok) {
+        if (ok) doAct(null, 'dev_unbind', { fp: fp, uid: uid }, load);
+      });
+    });
+
+    load();
+    return { reload: load, destroy: function () {} };
+  }
+
   // ==================== 视图：设置 ====================
   function viewSettings(root) {
     root.innerHTML =
@@ -752,6 +836,7 @@
     overview: viewOverview,
     accounts: viewAccounts,
     gateways: viewGateways,
+    devices: viewDevices,
     settings: viewSettings,
     logs: viewLogs
   };

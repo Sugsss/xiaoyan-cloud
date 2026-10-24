@@ -9,6 +9,7 @@ logs/
 accounts.json
 tokens.json
 ipuid.json
+devuid.json
 admin.json
 tenants.json
 admin_initial.txt
